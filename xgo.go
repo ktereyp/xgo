@@ -76,6 +76,7 @@ var (
 	buildTags    = flag.String("tags", "", "List of build tags to consider satisfied during the build")
 	buildLdFlags = flag.String("ldflags", "", "Arguments to pass on each go tool link invocation")
 	buildMode    = flag.String("buildmode", "default", "Indicates which kind of object file to build")
+	buildModule  = flag.String("buildmodule", "", "Indicates which kind of module to build")
 )
 
 // BuildFlags is a simple collection of flags to fine tune a build.
@@ -86,6 +87,7 @@ type BuildFlags struct {
 	Tags    string // List of build tags to consider satisfied during the build
 	LdFlags string // Arguments to pass on each go tool link invocation
 	Mode    string // Indicates which kind of object file to build
+	Module  string
 }
 
 func main() {
@@ -180,6 +182,7 @@ func main() {
 		Tags:    *buildTags,
 		LdFlags: *buildLdFlags,
 		Mode:    *buildMode,
+		Module:  *buildModule,
 	}
 	folder, err := os.Getwd()
 	if err != nil {
@@ -238,44 +241,43 @@ func compile(image string, config *ConfigFlags, flags *BuildFlags, folder string
 		config.Repository = resolveImportPath(config.Repository)
 
 		// Iterate over all the local libs and export the mount points
-		if os.Getenv("GOPATH") == "" {
-			log.Fatalf("No $GOPATH is set or forwarded to xgo")
-		}
-		for _, gopath := range strings.Split(os.Getenv("GOPATH"), string(os.PathListSeparator)) {
-			// Since docker sandboxes volumes, resolve any symlinks manually
-			sources := filepath.Join(gopath, "src")
-			filepath.Walk(sources, func(path string, info os.FileInfo, err error) error {
-				// Skip any folders that errored out
-				if err != nil {
-					log.Printf("Failed to access GOPATH element %s: %v", path, err)
+		if os.Getenv("GOPATH") != "" {
+			for _, gopath := range strings.Split(os.Getenv("GOPATH"), string(os.PathListSeparator)) {
+				// Since docker sandboxes volumes, resolve any symlinks manually
+				sources := filepath.Join(gopath, "src")
+				filepath.Walk(sources, func(path string, info os.FileInfo, err error) error {
+					// Skip any folders that errored out
+					if err != nil {
+						log.Printf("Failed to access GOPATH element %s: %v", path, err)
+						return nil
+					}
+					// Skip anything that's not a symlink
+					if info.Mode()&os.ModeSymlink == 0 {
+						return nil
+					}
+					// Resolve the symlink and skip if it's not a folder
+					target, err := filepath.EvalSymlinks(path)
+					if err != nil {
+						return nil
+					}
+					if info, err = os.Stat(target); err != nil || !info.IsDir() {
+						return nil
+					}
+					// Skip if the symlink points within GOPATH
+					if filepath.HasPrefix(target, sources) {
+						return nil
+					}
+					// Folder needs explicit mounting due to docker symlink security
+					locals = append(locals, target)
+					mounts = append(mounts, filepath.Join("/ext-go", strconv.Itoa(len(locals)), "src", strings.TrimPrefix(path, sources)))
+					paths = append(paths, filepath.Join("/ext-go", strconv.Itoa(len(locals))))
 					return nil
-				}
-				// Skip anything that's not a symlink
-				if info.Mode()&os.ModeSymlink == 0 {
-					return nil
-				}
-				// Resolve the symlink and skip if it's not a folder
-				target, err := filepath.EvalSymlinks(path)
-				if err != nil {
-					return nil
-				}
-				if info, err = os.Stat(target); err != nil || !info.IsDir() {
-					return nil
-				}
-				// Skip if the symlink points within GOPATH
-				if filepath.HasPrefix(target, sources) {
-					return nil
-				}
-				// Folder needs explicit mounting due to docker symlink security
-				locals = append(locals, target)
-				mounts = append(mounts, filepath.Join("/ext-go", strconv.Itoa(len(locals)), "src", strings.TrimPrefix(path, sources)))
+				})
+				// Export the main mount point for this GOPATH entry
+				locals = append(locals, sources)
+				mounts = append(mounts, filepath.Join("/ext-go", strconv.Itoa(len(locals)), "src"))
 				paths = append(paths, filepath.Join("/ext-go", strconv.Itoa(len(locals))))
-				return nil
-			})
-			// Export the main mount point for this GOPATH entry
-			locals = append(locals, sources)
-			mounts = append(mounts, filepath.Join("/ext-go", strconv.Itoa(len(locals)), "src"))
-			paths = append(paths, filepath.Join("/ext-go", strconv.Itoa(len(locals))))
+			}
 		}
 	}
 	// Assemble and run the cross compilation command
@@ -297,6 +299,7 @@ func compile(image string, config *ConfigFlags, flags *BuildFlags, folder string
 		"-e", fmt.Sprintf("FLAG_TAGS=%s", flags.Tags),
 		"-e", fmt.Sprintf("FLAG_LDFLAGS=%s", flags.LdFlags),
 		"-e", fmt.Sprintf("FLAG_BUILDMODE=%s", flags.Mode),
+		"-e", fmt.Sprintf("FLAG_BUILDMODULE=%s", flags.Module),
 		"-e", "TARGETS=" + strings.Replace(strings.Join(config.Targets, " "), "*", ".", -1),
 	}
 	for i := 0; i < len(locals); i++ {
@@ -332,6 +335,7 @@ func compileContained(config *ConfigFlags, flags *BuildFlags, folder string) err
 		fmt.Sprintf("FLAG_TAGS=%s", flags.Tags),
 		fmt.Sprintf("FLAG_LDFLAGS=%s", flags.LdFlags),
 		fmt.Sprintf("FLAG_BUILDMODE=%s", flags.Mode),
+		fmt.Sprintf("FLAG_BUILD=%s", flags.Mode),
 		"TARGETS=" + strings.Replace(strings.Join(config.Targets, " "), "*", ".", -1),
 	}
 	if local {
